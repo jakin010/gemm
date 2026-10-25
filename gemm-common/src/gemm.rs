@@ -17,6 +17,89 @@ pub type c32 = num_complex::Complex32;
 #[allow(non_camel_case_types)]
 pub type c64 = num_complex::Complex64;
 
+/// Default for [`x86_v4_factor`].
+pub const DEFAULT_X86_V4_FACTOR: usize = 4;
+
+// usize::MAX: not decided yet (read GEMM_X86_V4_FACTOR on first use).
+static X86_V4_FACTOR: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// How many `rhs` columns per conflicting `lhs` row it takes before the AVX-512 kernels
+/// beat the AVX2 ones, see [`prefer_x86_v3`]. 0 turns the switch off (always AVX-512).
+///
+/// Read from the `GEMM_X86_V4_FACTOR` environment variable on first use (with the `std`
+/// feature), or set with [`set_x86_v4_factor`].
+#[inline]
+pub fn x86_v4_factor() -> usize {
+    let factor = X86_V4_FACTOR.load(Ordering::Relaxed);
+    if factor != usize::MAX {
+        return factor;
+    }
+    init_x86_v4_factor()
+}
+
+#[cold]
+fn init_x86_v4_factor() -> usize {
+    #[cfg(feature = "std")]
+    let factor = std::env::var("GEMM_X86_V4_FACTOR")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_X86_V4_FACTOR);
+    #[cfg(not(feature = "std"))]
+    let factor = DEFAULT_X86_V4_FACTOR;
+    let factor = factor.min(usize::MAX - 1);
+    // A concurrent `set_x86_v4_factor` wins over the environment.
+    match X86_V4_FACTOR.compare_exchange(usize::MAX, factor, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => factor,
+        Err(current) => current,
+    }
+}
+
+/// Sets [`x86_v4_factor`] for the whole process, overriding `GEMM_X86_V4_FACTOR`.
+pub fn set_x86_v4_factor(factor: usize) {
+    X86_V4_FACTOR.store(factor.min(usize::MAX - 1), Ordering::Relaxed);
+}
+
+/// Whether a matmul should run on the AVX2 (`x86-v3`) kernels although AVX-512 ones are
+/// available (the `x86-v4` feature, real types only).
+///
+/// The AVX-512 kernels pack `lhs` `v4_mr` rows at a time (48 for f32), twice as many as
+/// the AVX2 ones. When a row-major `lhs` has a row stride that is a multiple of 1 KiB or
+/// more, such as a weight matrix with `k` = 768 or 3072 floats, those rows start in at
+/// most 4 of the L1 cache's sets. With at least as many rows per set as the cache has ways
+/// they evict each other while being packed, which costs more than the AVX-512
+/// microkernel saves until `n` (the columns of `rhs`, e.g. tokens) amortizes it: about
+/// [`x86_v4_factor`] times the rows per set. On a Zen 5 EPYC, 15 x 3072 x 768 took 2.3x
+/// longer on AVX-512 and 15 x 1152 x 768 (rows in 8 sets) did not.
+#[inline]
+pub fn prefer_x86_v3(
+    n: usize,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    elem_bytes: usize,
+    v4_mr: usize,
+) -> bool {
+    // Every x86 CPU with AVX-512 has a 4 KiB L1d way (64 sets of 64-byte lines, as the
+    // cache is indexed within a page) and 8 or 12 ways. Fixed rather than taken from
+    // CACHE_INFO, which VMs can get wrong (64 KiB, 2-way on a Zen 5 EPYC VM).
+    const WAY_BYTES: usize = 4096;
+    const LINE_BYTES: usize = 64;
+    const MIN_WAYS: usize = 8;
+
+    let factor = x86_v4_factor();
+    if factor == 0 || lhs_cs.unsigned_abs() != 1 {
+        return false;
+    }
+    // Row starts repeat their L1 set every WAY_BYTES.
+    let stride = (lhs_rs.unsigned_abs() * elem_bytes).max(1);
+    let (mut a, mut b) = (stride, WAY_BYTES);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let sets = (WAY_BYTES / a).min(WAY_BYTES / LINE_BYTES);
+    let rows_per_set = v4_mr.msrv_div_ceil(sets);
+    rows_per_set >= MIN_WAYS && n < factor.saturating_mul(rows_per_set)
+}
+
 // https://rust-lang.github.io/hashbrown/src/crossbeam_utils/cache_padded.rs.html#128-130
 pub const CACHELINE_ALIGN: usize = {
     #[cfg(any(
@@ -1013,6 +1096,11 @@ macro_rules! gemm_def {
             {
                 #[cfg(feature = "x86-v4")]
                 if $crate::feature_detected!("avx512f") {
+                    // Some small matmuls go to the AVX2 kernels, see
+                    // `gemm_common::gemm::prefer_x86_v3`.
+                    if $crate::feature_detected!("fma") {
+                        return avx512f_or_fma_gemm_basic;
+                    }
                     return avx512f::gemm_basic;
                 }
                 if $crate::feature_detected!("fma") {
@@ -1080,6 +1168,68 @@ macro_rules! gemm_def {
         $crate::__inject_mod!(fma, $ty, 4 * $multiplier, V3, false);
         #[cfg(all(feature = "x86-v4", any(target_arch = "x86", target_arch = "x86_64")))]
         $crate::__inject_mod!(avx512f, $ty, 8 * $multiplier, V4, false);
+
+        // The AVX-512 kernels, except for small matmuls whose `lhs` packing thrashes the L1
+        // cache (see `gemm_common::gemm::prefer_x86_v3`). Each kernel computes the whole
+        // matmul.
+        #[cfg(all(feature = "x86-v4", any(target_arch = "x86", target_arch = "x86_64")))]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn avx512f_or_fma_gemm_basic(
+            m: usize,
+            n: usize,
+            k: usize,
+            dst: *mut T,
+            dst_cs: isize,
+            dst_rs: isize,
+            read_dst: bool,
+            lhs: *const T,
+            lhs_cs: isize,
+            lhs_rs: isize,
+            rhs: *const T,
+            rhs_cs: isize,
+            rhs_rs: isize,
+            alpha: T,
+            beta: T,
+            conj_dst: bool,
+            conj_lhs: bool,
+            conj_rhs: bool,
+            parallelism: $crate::Parallelism,
+        ) {
+            // Rows of lhs the AVX-512 kernels pack at a time.
+            let v4_mr = crate::microkernel::avx512f::$ty::MR_DIV_N * (8 * $multiplier);
+            let gemm_basic: GemmTy = if $crate::gemm::prefer_x86_v3(
+                n,
+                lhs_cs,
+                lhs_rs,
+                ::core::mem::size_of::<T>(),
+                v4_mr,
+            ) {
+                fma::gemm_basic
+            } else {
+                avx512f::gemm_basic
+            };
+            gemm_basic(
+                m,
+                n,
+                k,
+                dst,
+                dst_cs,
+                dst_rs,
+                read_dst,
+                lhs,
+                lhs_cs,
+                lhs_rs,
+                rhs,
+                rhs_cs,
+                rhs_rs,
+                alpha,
+                beta,
+                conj_dst,
+                conj_lhs,
+                conj_rhs,
+                parallelism,
+            )
+        }
 
         #[cfg(target_arch = "aarch64")]
         $crate::__inject_mod!(neon, $ty, 2 * $multiplier, Scalar, false);
